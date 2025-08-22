@@ -1,0 +1,237 @@
+import os
+import json
+import time
+from typing import List, Dict
+
+import streamlit as st
+
+# ===== OpenAI SDK 호환 래퍼 (v1 계열/구버전 둘 다 지원) =====
+try:
+    from openai import OpenAI
+    _client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    def call_openai(model: str, messages: List[Dict], temperature: float = 0.7, max_tokens: int = 1200):
+        resp = _client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return resp.choices[0].message.content
+except Exception:
+    import openai  # type: ignore
+    if not os.getenv("OPENAI_API_KEY") and hasattr(openai, "api_key") and not openai.api_key:
+        openai.api_key = st.secrets.get("OPENAI_API_KEY", "")
+    def call_openai(model: str, messages: List[Dict], temperature: float = 0.7, max_tokens: int = 1200):
+        resp = openai.ChatCompletion.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return resp["choices"][0]["message"]["content"]
+
+# ===== 페이지 설정 =====
+st.set_page_config(page_title="✍️ AI 자기소개서 작성기 — 확장판", layout="wide")
+st.title("✍️ AI 자기소개서 작성기 — 확장판")
+st.caption("입력 → 초안 생성 → 길이/톤 보정 → 키워드 커버리지 분석 → 점수화 → 내보내기")
+
+# ===== 사이드바: 전역 설정 =====
+with st.sidebar:
+    st.header("⚙️ 설정")
+    # API Key 입력(선택) — 환경변수 우선, 비어있으면 입력받아 session_state에 저장
+    if not os.getenv("OPENAI_API_KEY"):
+        api_key_in = st.text_input("OpenAI API Key", type="password", help="환경변수에 없으면 여기 입력 (sk-로 시작)")
+        if api_key_in:
+            os.environ["OPENAI_API_KEY"] = api_key_in
+    model = st.selectbox("모델", ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"], index=0)
+    temperature = st.slider("창의성 (temperature)", 0.0, 1.2, 0.7, 0.1)
+    target_len = st.number_input("목표 글자수(한글)", 200, 2000, 800, 50)
+    tone = st.selectbox("톤/스타일", [
+        "정중하고 간결한", "열정적이고 직설적인", "논리적이고 분석적인", "따뜻하고 스토리텔링 위주"
+    ])
+    add_metrics = st.checkbox("키워드 커버리지/ATS 점수 표시", True)
+
+# ===== 입력 폼 =====
+st.subheader("1) 입력")
+colA, colB = st.columns(2)
+with colA:
+    job_title = st.text_input("지원 직무/회사 (예: 데이터 분석가 / ABC) ")
+    jd_text = st.text_area("채용 공고/직무 기술서 (붙여넣기)", height=180,
+                           help="주요 요구역량/키워드를 포함하면 커버리지 분석에 활용됩니다.")
+with colB:
+    resume_text = st.text_area("이력/경험 요약 (붙여넣기)", height=180,
+                               help="핵심 프로젝트, 성과(숫자), 기술 스택을 짧게 정리하면 품질이 좋아집니다.")
+
+questions = st.text_area(
+    "자기소개서 문항(한 줄에 하나)",
+    value=("지원 동기와 입사 후 포부를 작성해주세요.\n"
+           "본인의 강점과 이를 증명하는 사례를 작성해주세요.\n"
+           "협업/갈등 상황을 해결한 경험을 작성해주세요."),
+    height=120,
+)
+
+# ===== 유틸 =====
+def extract_keywords(text: str, top_k: int = 20) -> List[str]:
+    if not text.strip():
+        return []
+    prompt = f"""
+    아래 채용 공고/직무 설명에서 중요한 키워드(단어 또는 2~3어 구)를 한국어로 최대 {top_k}개 추출해줘.
+    중요도 순으로 쉼표로만 나열하고 불필요한 설명은 하지 마.
+    텍스트:\n{text}
+    """.strip()
+    try:
+        out = call_openai(model, [
+            {"role": "system", "content": "당신은 요약과 키워드 추출 전문가입니다."},
+            {"role": "user", "content": prompt}
+        ], temperature=0.1, max_tokens=400)
+        # 쉼표 분리
+        kws = [t.strip().strip(".,·") for t in out.split(",") if t.strip()]
+        return kws[:top_k]
+    except Exception:
+        return []
+
+@st.cache_data(show_spinner=False)
+def score_coverage(draft: str, keywords: List[str]) -> Dict:
+    if not draft or not keywords:
+        return {"covered": [], "missing": keywords, "coverage": 0.0}
+    covered = [k for k in keywords if k.lower() in draft.lower()]
+    missing = [k for k in keywords if k.lower() not in draft.lower()]
+    cov = round(100.0 * len(covered) / max(1, len(keywords)), 1)
+    return {"covered": covered, "missing": missing, "coverage": cov}
+
+def refine_length_korean(text: str, target_chars: int) -> str:
+    prompt = f"""
+    다음 글을 한국어 {target_chars}자 내외로 다듬어줘. 말투는 자연스럽고 {tone} 톤을 유지하고, 핵심 메시지를 보존해.
+    불필요한 군더더기를 제거하되, 구체적 수치/성과는 유지해.
+
+    원문:\n{text}
+    """.strip()
+    return call_openai(model, [
+        {"role": "system", "content": "너는 전문 에디터다. 길이/톤 보정을 정확히 수행한다."},
+        {"role": "user", "content": prompt},
+    ], temperature=0.4, max_tokens=1000)
+
+# ===== 생성 버튼 =====
+st.subheader("2) 생성")
+col1, col2, col3 = st.columns([1,1,1])
+run_gen = col1.button("초안 생성")
+run_refine = col2.button("길이/톤 보정")
+run_both = col3.button("초안+보정 한 번에")
+
+# 세션 상태
+for key in ["draft", "refined", "keywords", "coverage_result"]:
+    if key not in st.session_state:
+        st.session_state[key] = None
+
+# ===== 초안 생성 로직 =====
+if run_gen or run_both:
+    if not os.getenv("OPENAI_API_KEY"):
+        st.error("API Key가 설정되지 않았습니다. 사이드바에 입력하거나 환경변수를 설정하세요.")
+    else:
+        with st.spinner("초안을 생성 중입니다..."):
+            try:
+                msg_user = f"""
+                다음 정보를 바탕으로 한국어 자기소개서 초안을 작성해줘.
+                - 직무/회사: {job_title}
+                - 이력/경험 요약: {resume_text}
+                - 문항 목록:\n{questions}
+                요구사항:
+                1) 각 문항별로 1개 문단씩 답변
+                2) {tone} 톤 유지, 모호한 수사를 줄이고 수치/성과를 포함
+                3) 표절/인터넷 긁어오기 금지, 나만의 경험 중심 서술
+                4) 문항 제목을 굵게 표시
+                """.strip()
+                draft = call_openai(model, [
+                    {"role": "system", "content": "너는 취업 자기소개서 작성 전문가다."},
+                    {"role": "user", "content": msg_user}
+                ], temperature=temperature, max_tokens=1400)
+                st.session_state.draft = draft
+                st.success("초안 생성 완료")
+            except Exception as e:
+                st.error(f"초안 생성 실패: {e}")
+
+# ===== 길이/톤 보정 =====
+if run_refine or run_both:
+    if not st.session_state.get("draft"):
+        st.warning("먼저 초안을 생성하세요.")
+    else:
+        with st.spinner("길이/톤 보정 중..."):
+            try:
+                st.session_state.refined = refine_length_korean(st.session_state.draft, int(target_len))
+                st.success("보정 완료")
+            except Exception as e:
+                st.error(f"보정 실패: {e}")
+
+# ===== 키워드 & ATS 점수 =====
+if add_metrics and (st.session_state.get("draft") or st.session_state.get("refined")):
+    base_text = st.session_state.get("refined") or st.session_state.get("draft")
+    if st.session_state.keywords is None:
+        st.session_state.keywords = extract_keywords(jd_text, top_k=20)
+    kws = st.session_state.keywords or []
+    cov = score_coverage(base_text, kws)
+    st.session_state.coverage_result = cov
+
+# ===== 출력 =====
+st.subheader("3) 결과")
+left, right = st.columns(2)
+with left:
+    st.markdown("**초안**")
+    st.write(st.session_state.get("draft") or "(아직 생성되지 않았습니다)")
+with right:
+    st.markdown("**보정본(목표 길이 반영)**")
+    st.write(st.session_state.get("refined") or "(보정 전입니다)")
+
+# 메트릭
+if add_metrics and st.session_state.get("coverage_result"):
+    st.subheader("4) 키워드 커버리지 / 간이 ATS 점수")
+    colm1, colm2 = st.columns([1,2])
+    with colm1:
+        st.metric("키워드 커버리지", f"{st.session_state.coverage_result['coverage']}%")
+        ats = round(min(100.0, st.session_state.coverage_result['coverage'] * 1.0), 1)
+        st.metric("간이 ATS 점수", f"{ats}")
+    with colm2:
+        covered = st.session_state.coverage_result['covered']
+        missing = st.session_state.coverage_result['missing']
+        st.markdown("**커버된 키워드**: " + (", ".join(covered) if covered else "없음"))
+        st.markdown("**부족한 키워드**: " + (", ".join(missing) if missing else "없음"))
+
+# ===== 내보내기 =====
+st.subheader("5) 내보내기")
+export_target = st.session_state.get("refined") or st.session_state.get("draft") or ""
+if export_target:
+    md_content = f"# 자기소개서\n\n{export_target}\n"
+    st.download_button("Markdown 다운로드 (.md)", data=md_content.encode("utf-8"), file_name="cover_letter.md", mime="text/markdown")
+    # JSON 저장 (버전 관리 용도)
+    payload = {
+        "job_title": job_title,
+        "jd_text": jd_text,
+        "resume_text": resume_text,
+        "questions": questions,
+        "draft": st.session_state.get("draft"),
+        "refined": st.session_state.get("refined"),
+        "keywords": st.session_state.get("keywords"),
+        "coverage": st.session_state.get("coverage_result"),
+        "model": model,
+        "temperature": temperature,
+        "target_len": target_len,
+        "tone": tone,
+        "timestamp": int(time.time())
+    }
+    st.download_button("프로젝트 저장 (.json)", data=json.dumps(payload, ensure_ascii=False, indent=2),
+                       file_name="cover_letter_project.json", mime="application/json")
+else:
+    st.info("먼저 초안 또는 보정본을 생성하세요.")
+
+# ===== 품질 체크(클리셰 감지) =====
+st.subheader("6) 빠른 품질 체크")
+common_cliche = [
+    "열정", "성실", "책임감", "소통", "협업", "주인의식", "문제해결", "성장", "도전", "지원 동기"
+]
+text_to_check = st.session_state.get("refined") or st.session_state.get("draft") or ""
+if text_to_check:
+    overused = [w for w in common_cliche if text_to_check.count(w) >= 3]
+    if overused:
+        st.warning("클리셰 과다 사용 가능성: " + ", ".join(overused))
+    else:
+        st.success("클리셰 과다 사용은 보이지 않습니다.")
+    st.caption("참고: 실제 품질은 맥락/구체성/수치 여부에 좌우됩니다.")
